@@ -29,10 +29,7 @@ func init() {
 	raven.SetSourceCodeLoader(loader)
 }
 
-var (
-	clients    = make(map[string]*raven.Client)
-	clientsMut sync.Mutex
-)
+var clients sync.Map
 
 type sentryService struct {
 	dsn   string
@@ -76,27 +73,26 @@ func (s *sentryService) Send(reportID, userID string, data []byte) bool {
 func sendReport(dsn string, pkt *raven.Packet, userID string) error {
 	pkt.Interfaces = append(pkt.Interfaces, &raven.User{ID: userID})
 
-	clientsMut.Lock()
-	defer clientsMut.Unlock()
-
-	cli, ok := clients[dsn]
+	cli, ok := clients.Load(dsn)
 	if !ok {
 		var err error
-		cli, err = raven.New(dsn)
+		newCli, err := raven.New(dsn)
 		if err != nil {
 			return err
 		}
-		clients[dsn] = cli
+		cli, _ = clients.LoadOrStore(dsn, newCli)
 	}
+
+	ravenClient := cli.(*raven.Client)
 
 	// The client sets release and such on the packet before sending, in the
 	// misguided idea that it knows this better than than the packet we give
 	// it. So we copy the values from the packet to the client first...
-	cli.SetRelease(pkt.Release)
-	cli.SetEnvironment(pkt.Environment)
+	ravenClient.SetRelease(pkt.Release)
+	ravenClient.SetEnvironment(pkt.Environment)
 
-	defer cli.Wait()
-	_, errC := cli.Capture(pkt, nil)
+	defer ravenClient.Wait()
+	_, errC := ravenClient.Capture(pkt, nil)
 	return <-errC
 }
 

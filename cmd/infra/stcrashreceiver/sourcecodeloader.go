@@ -23,7 +23,7 @@ const (
 )
 
 type githubSourceCodeLoader struct {
-	mut     sync.Mutex
+	mut     sync.RWMutex
 	version string
 	cache   map[string]map[string][][]byte // version -> file -> lines
 	client  *http.Client
@@ -38,20 +38,29 @@ func newGithubSourceCodeLoader() *githubSourceCodeLoader {
 
 func (l *githubSourceCodeLoader) LockWithVersion(version string) {
 	l.mut.Lock()
+	defer l.mut.Unlock()
 	l.version = version
 	if _, ok := l.cache[version]; !ok {
 		l.cache[version] = make(map[string][][]byte)
 	}
 }
 
-func (l *githubSourceCodeLoader) Unlock() {
-	l.mut.Unlock()
-}
-
 func (l *githubSourceCodeLoader) Load(filename string, line, context int) ([][]byte, int) {
 	filename = filepath.ToSlash(filename)
+	
+	l.mut.RLock()
 	lines, ok := l.cache[l.version][filename]
+	l.mut.RUnlock()
+	
 	if !ok {
+		l.mut.Lock()
+		defer l.mut.Unlock()
+		
+		// Double-check if the file was loaded while waiting for the lock
+		if lines, ok = l.cache[l.version][filename]; ok {
+			return getLineFromLines(lines, line, context)
+		}
+		
 		// Cache whatever we managed to find (or nil if nothing, so we don't try again)
 		defer func() {
 			l.cache[l.version][filename] = lines
