@@ -27,9 +27,8 @@ type tokenManager struct {
 
 	timeNow func() time.Time // can be overridden for testing
 
-	mut       sync.Mutex
-	tokens    *TokenSet
-	saveTimer *time.Timer
+	tokens    atomic.Pointer[TokenSet]
+	saveTimer atomic.Pointer[time.Timer]
 }
 
 func newTokenManager(key string, miscDB *db.NamespacedKV, lifetime time.Duration, maxItems int) *tokenManager {
@@ -39,104 +38,136 @@ func newTokenManager(key string, miscDB *db.NamespacedKV, lifetime time.Duration
 	if bs, ok, _ := miscDB.Bytes(key); ok {
 		_ = tokens.Unmarshal(bs) // best effort
 	}
-	return &tokenManager{
+	tm := &tokenManager{
 		key:      key,
 		miscDB:   miscDB,
 		lifetime: lifetime,
 		maxItems: maxItems,
 		timeNow:  time.Now,
-		mut:      sync.NewMutex(),
-		tokens:   tokens,
 	}
+	tm.tokens.Store(tokens)
+	return tm
 }
 
 // Check returns true if the token is valid, and updates the token's expiry
 // time. The token is removed if it is expired.
 func (m *tokenManager) Check(token string) bool {
-	m.mut.Lock()
-	defer m.mut.Unlock()
+	for {
+		oldTokens := m.tokens.Load()
+		expires, ok := oldTokens.Tokens[token]
+		if !ok {
+			return false
+		}
 
-	expires, ok := m.tokens.Tokens[token]
-	if ok {
 		if expires < m.timeNow().UnixNano() {
 			// The token is expired.
-			m.saveLocked() // removes expired tokens
+			m.save() // removes expired tokens
 			return false
 		}
 
 		// Give the token further life.
-		m.tokens.Tokens[token] = m.timeNow().Add(m.lifetime).UnixNano()
-		m.saveLocked()
+		newTokens := &TokenSet{Tokens: make(map[string]int64)}
+		for k, v := range oldTokens.Tokens {
+			newTokens.Tokens[k] = v
+		}
+		newTokens.Tokens[token] = m.timeNow().Add(m.lifetime).UnixNano()
+
+		if m.tokens.CompareAndSwap(oldTokens, newTokens) {
+			m.save()
+			return true
+		}
+		// If CAS failed, retry the operation
 	}
-	return ok
 }
 
 // New creates a new token and returns it.
 func (m *tokenManager) New() string {
 	token := rand.String(randomTokenLength)
 
-	m.mut.Lock()
-	defer m.mut.Unlock()
+	for {
+		oldTokens := m.tokens.Load()
+		newTokens := &TokenSet{Tokens: make(map[string]int64)}
+		for k, v := range oldTokens.Tokens {
+			newTokens.Tokens[k] = v
+		}
+		newTokens.Tokens[token] = m.timeNow().Add(m.lifetime).UnixNano()
 
-	m.tokens.Tokens[token] = m.timeNow().Add(m.lifetime).UnixNano()
-	m.saveLocked()
-
-	return token
+		if m.tokens.CompareAndSwap(oldTokens, newTokens) {
+			m.save()
+			return token
+		}
+		// If CAS failed, retry the operation
+	}
 }
 
 // Delete removes a token.
 func (m *tokenManager) Delete(token string) {
-	m.mut.Lock()
-	defer m.mut.Unlock()
+	for {
+		oldTokens := m.tokens.Load()
+		newTokens := &TokenSet{Tokens: make(map[string]int64)}
+		for k, v := range oldTokens.Tokens {
+			if k != token {
+				newTokens.Tokens[k] = v
+			}
+		}
 
-	delete(m.tokens.Tokens, token)
-	m.saveLocked()
+		if m.tokens.CompareAndSwap(oldTokens, newTokens) {
+			m.save()
+			return
+		}
+		// If CAS failed, retry the operation
+	}
 }
 
-func (m *tokenManager) saveLocked() {
-	// Remove expired tokens.
-	now := m.timeNow().UnixNano()
-	for token, expiry := range m.tokens.Tokens {
-		if expiry < now {
-			delete(m.tokens.Tokens, token)
-		}
-	}
+func (m *tokenManager) save() {
+	for {
+		oldTokens := m.tokens.Load()
+		newTokens := &TokenSet{Tokens: make(map[string]int64)}
 
-	// If we have a limit on the number of tokens, remove the oldest ones.
-	if m.maxItems > 0 && len(m.tokens.Tokens) > m.maxItems {
-		// Sort the tokens by expiry time, oldest first.
-		type tokenExpiry struct {
-			token  string
-			expiry int64
+		// Remove expired tokens.
+		now := m.timeNow().UnixNano()
+		for token, expiry := range oldTokens.Tokens {
+			if expiry >= now {
+				newTokens.Tokens[token] = expiry
+			}
 		}
-		var tokens []tokenExpiry
-		for token, expiry := range m.tokens.Tokens {
-			tokens = append(tokens, tokenExpiry{token, expiry})
-		}
-		slices.SortFunc(tokens, func(i, j tokenExpiry) int {
-			return int(i.expiry - j.expiry)
-		})
-		// Remove the oldest tokens.
-		for _, token := range tokens[:len(tokens)-m.maxItems] {
-			delete(m.tokens.Tokens, token.token)
-		}
-	}
 
-	// Postpone saving until one second of inactivity.
-	if m.saveTimer == nil {
-		m.saveTimer = time.AfterFunc(time.Second, m.scheduledSave)
-	} else {
-		m.saveTimer.Reset(time.Second)
+		// If we have a limit on the number of tokens, remove the oldest ones.
+		if m.maxItems > 0 && len(newTokens.Tokens) > m.maxItems {
+			type tokenExpiry struct {
+				token  string
+				expiry int64
+			}
+			var tokens []tokenExpiry
+			for token, expiry := range newTokens.Tokens {
+				tokens = append(tokens, tokenExpiry{token, expiry})
+			}
+			slices.SortFunc(tokens, func(i, j tokenExpiry) int {
+				return int(i.expiry - j.expiry)
+			})
+			newTokens.Tokens = make(map[string]int64)
+			for _, te := range tokens[len(tokens)-m.maxItems:] {
+				newTokens.Tokens[te.token] = te.expiry
+			}
+		}
+
+		if m.tokens.CompareAndSwap(oldTokens, newTokens) {
+			// Postpone saving until one second of inactivity.
+			oldTimer := m.saveTimer.Swap(time.AfterFunc(time.Second, m.scheduledSave))
+			if oldTimer != nil {
+				oldTimer.Stop()
+			}
+			return
+		}
+		// If CAS failed, retry the operation
 	}
 }
 
 func (m *tokenManager) scheduledSave() {
-	m.mut.Lock()
-	defer m.mut.Unlock()
+	m.saveTimer.Store((*time.Timer)(nil))
 
-	m.saveTimer = nil
-
-	bs, _ := m.tokens.Marshal()      // can't fail
+	tokens := m.tokens.Load()
+	bs, _ := tokens.Marshal()      // can't fail
 	_ = m.miscDB.PutBytes(m.key, bs) // can fail, but what are we going to do?
 }
 
